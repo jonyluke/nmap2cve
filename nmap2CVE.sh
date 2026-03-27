@@ -85,58 +85,65 @@ nvd_fetch() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FASE 1: Poblar caché secuencialmente — sin rate limiting
+# FASE 1: Poblar caché en paralelo — pasada principal + pasada de fallbacks
 # ─────────────────────────────────────────────────────────────────────────────
 echo -e "${B}Consultando NVD API...${N}"
 declare -A QUERY_VISTO
 declare -i ACTUAL=0
 
+# Pasada 1: todas las queries principales en paralelo
 while IFS='|' read -r _ _ _ _ producto version cpe; do
     [ -z "$producto" ] && continue
     cpe=$(echo "$cpe" | tr -d '[:space:]')
-
     version_limpia=$(echo "$version" | grep -oP '^\S+')
-    version_fallback=$(echo "$version_limpia" | grep -oP '^\d+\.\d+')
     producto_nvd=$(expandir_producto "$producto")
 
     if echo "$cpe" | grep -qP 'cpe:/.:\w+:\w+:\d'; then
         cpe23=$(cpe22_a_23 "$cpe")
         key="cpe_${cpe23}"
         if [ -z "${QUERY_VISTO[$key]}" ]; then
-            QUERY_VISTO[$key]=1
-            (( ACTUAL++ ))
-            printf "\r${B}[%d]${N} %s %-50s" "$ACTUAL" "CPE    " "${cpe23:0:55}" >&2
-            nvd_fetch "cpe" "$cpe23"
-            # Fallback a keyword si CPE devuelve 0 (CVEs con rangos de versión)
-            cache_cpe="$CACHE_DIR/$(echo "cpe_${cpe23}" | md5sum | cut -d' ' -f1).json"
-            if [ -f "$cache_cpe" ] && [ "$(jq '.vulnerabilities | length' "$cache_cpe")" -eq 0 ]; then
-                for ver in "$version_limpia" "$version_fallback"; do
-                    [ -z "$ver" ] && continue
-                    query=$(printf '%s %s' "$producto_nvd" "$ver" | tr ' ' '+')
-                    key2="keyword_${query}"
-                    if [ -z "${QUERY_VISTO[$key2]}" ]; then
-                        QUERY_VISTO[$key2]=1
-                        (( ACTUAL++ )) || true
-                        printf "\r${B}[%d]${N} %s %-50s" "$ACTUAL" "keyword" "${query:0:55}" >&2
-                        nvd_fetch "keyword" "$query"
-                    fi
-                done
+            QUERY_VISTO[$key]=1; (( ACTUAL++ ))
+            printf "\r${B}[%d]${N} CPE     %-55s" "$ACTUAL" "${cpe23:0:55}" >&2
+            nvd_fetch "cpe" "$cpe23" &
+        fi
+    else
+        query=$(printf '%s %s' "$producto_nvd" "$version_limpia" | tr ' ' '+')
+        key="keyword_${query}"
+        if [ -z "${QUERY_VISTO[$key]}" ]; then
+            QUERY_VISTO[$key]=1; (( ACTUAL++ ))
+            printf "\r${B}[%d]${N} keyword %-55s" "$ACTUAL" "${query:0:55}" >&2
+            nvd_fetch "keyword" "$query" &
+        fi
+    fi
+done < <(echo "$ENTRADAS")
+wait
+
+# Pasada 2: fallbacks solo para queries que devolvieron 0 resultados
+while IFS='|' read -r _ _ _ _ producto version cpe; do
+    [ -z "$producto" ] && continue
+    cpe=$(echo "$cpe" | tr -d '[:space:]')
+    version_limpia=$(echo "$version" | grep -oP '^\S+')
+    version_fallback=$(echo "$version_limpia" | grep -oP '^\d+\.\d+')
+    producto_nvd=$(expandir_producto "$producto")
+
+    if echo "$cpe" | grep -qP 'cpe:/.:\w+:\w+:\d'; then
+        # CPE → 0 resultados → fallback keyword con versión limpia
+        cpe23=$(cpe22_a_23 "$cpe")
+        cache_cpe="$CACHE_DIR/$(echo "cpe_${cpe23}" | md5sum | cut -d' ' -f1).json"
+        if [ -f "$cache_cpe" ] && [ "$(jq '.vulnerabilities | length' "$cache_cpe")" -eq 0 ]; then
+            query=$(printf '%s %s' "$producto_nvd" "$version_limpia" | tr ' ' '+')
+            key="keyword_${query}"
+            if [ -z "${QUERY_VISTO[$key]}" ]; then
+                QUERY_VISTO[$key]=1; (( ACTUAL++ ))
+                printf "\r${B}[%d]${N} fallback%-55s" "$ACTUAL" "${query:0:55}" >&2
+                nvd_fetch "keyword" "$query" &
             fi
         fi
     else
-        for ver in "$version_limpia" "$version_fallback"; do
-            [ -z "$ver" ] && continue
-            query=$(printf '%s %s' "$producto_nvd" "$ver" | tr ' ' '+')
-            key="keyword_${query}"
-            if [ -z "${QUERY_VISTO[$key]}" ]; then
-                QUERY_VISTO[$key]=1
-                (( ACTUAL++ ))
-                printf "\r${B}[%d]${N} %s %-50s" "$ACTUAL" "keyword" "${query:0:55}" >&2
-                nvd_fetch "keyword" "$query"
-            fi
-        done
+        : # sin fallback para keyword — 0 resultados es la respuesta correcta
     fi
 done < <(echo "$ENTRADAS")
+wait
 echo -e "\r${G}✓ Consultas completadas${N}$(printf '%40s' '')" >&2
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,15 +179,6 @@ procesar_servicio() {
         local query
         query=$(printf '%s %s' "$producto_nvd" "$version_limpia" | tr ' ' '+')
         cache_file="$CACHE_DIR/$(echo "keyword_${query}" | md5sum | cut -d' ' -f1).json"
-
-        # Fallback a versión reducida si 0 resultados
-        if { [ ! -f "$cache_file" ] || [ "$(jq '.vulnerabilities | length' "$cache_file" 2>/dev/null)" -eq 0 ]; } \
-            && [ -n "$version_fallback" ] && [ "$version_fallback" != "$version_limpia" ]; then
-            local query_fb
-            query_fb=$(printf '%s %s' "$producto_nvd" "$version_fallback" | tr ' ' '+')
-            local cache_fb="$CACHE_DIR/$(echo "keyword_${query_fb}" | md5sum | cut -d' ' -f1).json"
-            [ -f "$cache_fb" ] && cache_file="$cache_fb" && query="$query_fb"
-        fi
 
         url="https://nvd.nist.gov/vuln/search#/nvd/home?keyword=$(printf '%s' "${query//+/ }" | jq -sRr @uri)&resultType=records"
     fi
